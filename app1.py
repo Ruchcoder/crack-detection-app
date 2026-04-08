@@ -1,46 +1,172 @@
 import streamlit as st
-import cv2
 import numpy as np
+from PIL import Image, ImageFilter, ImageDraw, ImageEnhance
+import io
 
-st.title("Pipeline Structural Health Monitoring System")
+st.title("Infrastructure Health Monitoring System")
+st.write("Detects cracks and rust on pipes/concrete surfaces with severity levels.")
 
 uploaded_file = st.file_uploader("Upload Image", type=["jpg","png","jpeg"])
 
 if uploaded_file is not None:
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = Image.open(uploaded_file).convert("RGB")
 
-    # Preprocess
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    # Resize for performance
+    max_width = 600
+    w_percent = max_width / float(image.width)
+    new_height = int(float(image.height) * w_percent)
+    image_resized = image.resize((max_width, new_height))
 
-    edges = cv2.Canny(blur, 10, 60)
+    # -------------------------
+    # CRACK DETECTION (EDGE)
+    # -------------------------
+    gray = image_resized.convert("L")
+    gray_enhanced = ImageEnhance.Contrast(gray).enhance(2.5)
 
-    kernel = np.ones((3,3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)
+    edges = gray_enhanced.filter(ImageFilter.FIND_EDGES)
+    edge_array = np.array(edges)
 
-    # Overlay cracks
-    image_rgb[edges > 0] = [255,0,0]
+    threshold = np.percentile(edge_array, 90)
+    edge_binary = edge_array > threshold
 
-    st.image(image_rgb, caption="Detected Cracks")
+    visited = np.zeros_like(edge_binary, dtype=bool)
+    crack_mask = np.zeros_like(edge_binary, dtype=bool)
 
-    # Result download
-    cv2.imwrite("result.jpg", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
-    with open("result.jpg", "rb") as f:
-        st.download_button("Download Result", f, "result.jpg")
+    min_region_size = 20
+    openings = []
+    opening_sizes = []
 
-    # Result message
-    if np.sum(edges) > 0:
-        st.success("Crack Detected")
+    def flood_fill(y, x):
+        stack = [(y, x)]
+        region_pixels = []
+        while stack:
+            cy, cx = stack.pop()
+            if cy < 0 or cy >= edge_binary.shape[0] or cx < 0 or cx >= edge_binary.shape[1]:
+                continue
+            if visited[cy, cx] or not edge_binary[cy, cx]:
+                continue
+            visited[cy, cx] = True
+            region_pixels.append((cy, cx))
+            stack.extend([(cy-1, cx), (cy+1, cx), (cy, cx-1), (cy, cx+1)])
+        return region_pixels
+
+    height, width = edge_binary.shape
+    for y in range(height):
+        for x in range(width):
+            if edge_binary[y, x] and not visited[y, x]:
+                pixels = flood_fill(y, x)
+                if len(pixels) >= min_region_size:
+                    openings.append(pixels)
+                    ys = [p[0] for p in pixels]
+                    xs = [p[1] for p in pixels]
+                    opening_width = max(xs) - min(xs) + 1
+                    opening_sizes.append(opening_width)
+                    for py, px in pixels:
+                        crack_mask[py, px] = True
+
+    crack_pixels = np.sum(crack_mask)
+
+    # -------------------------
+    # RUST DETECTION (COLOR)
+    # -------------------------
+    img_array = np.array(image_resized)
+
+    # Extract RGB channels
+    R = img_array[:, :, 0]
+    G = img_array[:, :, 1]
+    B = img_array[:, :, 2]
+
+    # Rust color condition (reddish-brown)
+    rust_mask = (R > 100) & (G < 100) & (B < 80) & (R > G) & (R > B)
+
+    rust_pixels = np.sum(rust_mask)
+
+    # -------------------------
+    # DRAW RESULTS
+    # -------------------------
+    draw = ImageDraw.Draw(image_resized)
+
+    # Draw cracks (red)
+    if crack_pixels > 200:
+        for y in range(height):
+            x_positions = np.where(crack_mask[y, :])[0]
+            if len(x_positions) > 0:
+                start = x_positions[0]
+                prev = x_positions[0]
+                for x in x_positions[1:]:
+                    if x == prev + 1:
+                        prev = x
+                    else:
+                        draw.line((start, y, prev, y), fill="red", width=3)
+                        start = x
+                        prev = x
+                draw.line((start, y, prev, y), fill="red", width=3)
+
+    # Draw rust (orange overlay)
+    for y in range(height):
+        for x in range(width):
+            if rust_mask[y, x]:
+                draw.point((x, y), fill=(255, 165, 0))  # orange
+
+    # Show image
+    st.subheader("Detection Overlay")
+    st.image(image_resized, use_container_width=True)
+
+    # -------------------------
+    # SEVERITY ANALYSIS
+    # -------------------------
+    # Crack severity
+    if opening_sizes:
+        max_width_opening = max(opening_sizes)
+        if max_width_opening < 50:
+            crack_severity = "Low"
+        elif max_width_opening < 150:
+            crack_severity = "Moderate"
+        else:
+            crack_severity = "High"
     else:
-        st.info("No crack detected")
+        crack_severity = "None"
 
-    col1, col2 = st.columns(2)
+    # Rust severity
+    if rust_pixels < 500:
+        rust_severity = "Low"
+    elif rust_pixels < 2000:
+        rust_severity = "Moderate"
+    else:
+        rust_severity = "High"
 
-    with col1:
-        st.image(image_rgb, caption="Processed Image")
+    # -------------------------
+    # REPORT
+    # -------------------------
+    st.subheader("Inspection Report")
 
-    with col2:
-        st.image(edges, caption="Detected Edges")
+    if crack_pixels > 200:
+        st.success("Cracks Detected")
+        st.write(f"Crack Severity: {crack_severity}")
+    else:
+        st.info("No Significant Cracks Detected")
+
+    if rust_pixels > 100:
+        st.warning("Rust Detected")
+        st.write(f"Rust Severity: {rust_severity}")
+    else:
+        st.info("No Significant Rust Detected")
+
+    st.write("Recommended Action:")
+    st.write("- Inspect affected areas")
+    st.write("- Apply anti-corrosion treatment if rust is present")
+    st.write("- Repair cracks if detected")
+
+    # -------------------------
+    # DOWNLOAD
+    # -------------------------
+    buffer = io.BytesIO()
+    image_resized.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    st.download_button(
+        label="Download Processed Image",
+        data=buffer,
+        file_name="crack_rust_detection.png",
+        mime="image/png"
+    )
