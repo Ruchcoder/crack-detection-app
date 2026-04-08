@@ -1,5 +1,5 @@
 import streamlit as st
-import cv2
+
 import numpy as np
 
 st.title("Pipeline Structural Health Monitoring System")
